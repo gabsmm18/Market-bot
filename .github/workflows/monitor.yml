@@ -1,0 +1,43 @@
+name: Monitor stock crashes
+
+on:
+  # Gira ogni 15 minuti, dalle 13:00 alle 21:45 UTC, lun-ven.
+  # Questa finestra copre l'orario di mercato USA (9:30-16:00 ET) sia in
+  # ora legale che solare; lo script controlla comunque con precisione
+  # se il mercato e' aperto (funzione is_market_open) e non fa nulla se
+  # e' chiuso, quindi non c'e' rischio di falsi allarmi fuori orario.
+  schedule:
+    - cron: "*/15 13-21 * * 1-5"
+  # Permette anche di far partire il controllo a mano dalla tab "Actions" di GitHub
+  workflow_dispatch: {}
+
+permissions:
+  contents: write  # serve per poter salvare state.json aggiornato nel repo
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installa le dipendenze
+        run: pip install -r requirements.txt
+
+      - name: Controlla i crolli e notifica su Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DROP_THRESHOLD_PCT: "15"
+        run: python check_crashes.py
+
+      - name: Salva lo stato aggiornato (chi e' gia' stato notificato oggi)
+        run: |
+          git config user.name "markets-app-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "Aggiorna stato notifiche [skip ci]"
+          git push

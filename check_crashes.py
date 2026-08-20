@@ -20,6 +20,7 @@ mercati europei alla chiusura di quello USA) tramite GitHub Actions -- vedi
 import io
 import json
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -85,7 +86,7 @@ FTSE_MIB_TICKERS = [
     "BPE.MI", "CPR.MI", "DIA.MI", "ENEL.MI", "ENI.MI", "FBK.MI", "G.MI",
     "HER.MI", "IG.MI", "INW.MI", "IP.MI", "ISP.MI", "IVG.MI", "LDO.MI",
     "MB.MI", "MONC.MI", "NEXI.MI", "PIRC.MI", "PRY.MI", "PST.MI", "RACE.MI",
-    "REC.MI", "SPM.MI", "SRG.MI", "STLAM.MI", "STM.MI", "TEN.MI", "TIT.MI",
+    "REC.MI", "SPM.MI", "SRG.MI", "STLAM.MI", "STM", "TEN.MI", "TIT.MI",
     "TRN.MI", "UCG.MI", "UNI.MI",
 ]
 
@@ -121,17 +122,40 @@ def _fetch_wikipedia_tables(url: str) -> list:
     return pd.read_html(io.StringIO(resp.text))
 
 
-def _find_table_with_column(tables: list, keywords: list[str]):
-    """Cerca, tra le tabelle passate, la prima che ha una colonna il cui nome
-    contiene una delle parole chiave indicate (case-insensitive).
-    Restituisce (tabella, nome_colonna) oppure (None, None) se non trovata.
+_TICKER_LIKE = re.compile(r"^[A-Z]{1,6}(\.[A-Z]{1,2})?$")
+
+
+def _looks_like_ticker(value) -> bool:
+    return bool(_TICKER_LIKE.match(str(value).strip()))
+
+
+def _find_ticker_column(tables: list, min_matches: int):
+    """Cerca, in TUTTE le tabelle e TUTTE le colonne trovate nella pagina,
+    quella che contiene il maggior numero di valori con l'aspetto di un
+    ticker azionario (poche lettere maiuscole, es. "AAPL", "BRK.B").
+
+    E' un approccio piu' robusto della ricerca per nome di colonna (es.
+    "Ticker" o "Symbol"): non dipende da come la pagina Wikipedia chiama
+    quella colonna in un dato momento, ma guarda direttamente il contenuto.
+
+    Restituisce (tabella, nome_colonna) solo se la colonna migliore trovata
+    ha almeno `min_matches` valori che sembrano ticker validi -- una soglia
+    bassa indicherebbe che abbiamo preso per errore una tabella diversa
+    (es. un box di navigazione o una tabella di dati storici).
     """
+    best_table, best_col, best_count = None, None, 0
     for table in tables:
         for col in table.columns:
-            col_name = str(col).lower()
-            if any(kw in col_name for kw in keywords):
-                return table, col
-    return None, None
+            try:
+                values = table[col].astype(str)
+            except Exception:
+                continue
+            count = sum(1 for v in values if _looks_like_ticker(v))
+            if count > best_count:
+                best_table, best_col, best_count = table, col, count
+    if best_count >= min_matches:
+        return best_table, best_col
+    return None, best_count  # restituiamo comunque il conteggio migliore, utile per il debug
 
 
 def get_sp500_tickers() -> list[str]:
@@ -139,10 +163,10 @@ def get_sp500_tickers() -> list[str]:
         tables = _fetch_wikipedia_tables(
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         )
-        table, col = _find_table_with_column(tables, ["symbol"])
+        table, col_or_count = _find_ticker_column(tables, min_matches=400)
         if table is None:
-            raise ValueError("colonna 'Symbol' non trovata nella pagina")
-        return [str(t).strip() for t in table[col].tolist()]
+            raise ValueError(f"nessuna colonna con abbastanza ticker trovata (migliore: {col_or_count} valori)")
+        return [str(t).strip() for t in table[col_or_count].tolist()]
     except Exception as e:
         print(f"[WARN] impossibile scaricare la lista S&P 500: {e}")
         return []
@@ -151,19 +175,10 @@ def get_sp500_tickers() -> list[str]:
 def get_nasdaq100_tickers() -> list[str]:
     try:
         tables = _fetch_wikipedia_tables("https://en.wikipedia.org/wiki/Nasdaq-100")
-        # Cerchiamo sia "ticker" che "symbol" (pagine diverse usano nomi
-        # diversi per la stessa colonna), e scartiamo tabelle troppo
-        # piccole per essere quella dei componenti (l'indice ne ha ~100).
-        table = col = None
-        for keywords in (["ticker"], ["symbol"]):
-            candidate, candidate_col = _find_table_with_column(tables, keywords)
-            if candidate is not None and len(candidate) >= 50:
-                table, col = candidate, candidate_col
-                break
+        table, col_or_count = _find_ticker_column(tables, min_matches=80)
         if table is None:
-            cols_seen = [list(map(str, t.columns)) for t in tables]
-            raise ValueError(f"colonna ticker/symbol non trovata (colonne viste: {cols_seen})")
-        return [str(t).strip() for t in table[col].tolist()]
+            raise ValueError(f"nessuna colonna con abbastanza ticker trovata (migliore: {col_or_count} valori)")
+        return [str(t).strip() for t in table[col_or_count].tolist()]
     except Exception as e:
         print(f"[WARN] impossibile scaricare la lista Nasdaq-100: {e}")
         return []

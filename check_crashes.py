@@ -15,6 +15,7 @@ Pensato per girare periodicamente (es. ogni 15-30 minuti durante l'orario
 di mercato USA) tramite GitHub Actions -- vedi .github/workflows/monitor.yml
 """
 
+import io
 import json
 import os
 import sys
@@ -25,6 +26,17 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 import yfinance as yf
+
+# Wikipedia rifiuta le richieste che non sembrano provenire da un browser
+# (risponde 403 Forbidden alle richieste "anonime" tipiche di script/server,
+# come quelle che partono dai runner di GitHub Actions). Impostando uno
+# User-Agent che imita un browser reale, Wikipedia ci lascia passare.
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+}
 
 # ---------------------------------------------------------------------------
 # Configurazione
@@ -61,16 +73,26 @@ def get_tickers() -> list[str]:
     tickers = set()
 
     try:
-        sp500_tables = pd.read_html(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        resp = requests.get(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            headers=HTTP_HEADERS,
+            timeout=20,
         )
+        resp.raise_for_status()
+        sp500_tables = pd.read_html(io.StringIO(resp.text))
         sp500 = sp500_tables[0]["Symbol"].tolist()
         tickers.update(sp500)
     except Exception as e:
         print(f"[WARN] impossibile scaricare la lista S&P 500: {e}")
 
     try:
-        nasdaq_tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
+        resp = requests.get(
+            "https://en.wikipedia.org/wiki/Nasdaq-100",
+            headers=HTTP_HEADERS,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        nasdaq_tables = pd.read_html(io.StringIO(resp.text))
         # La tabella con i componenti e' quella che contiene la colonna "Ticker"
         for table in nasdaq_tables:
             if "Ticker" in table.columns:

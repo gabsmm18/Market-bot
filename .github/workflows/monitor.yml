@@ -7,7 +7,7 @@ on:
   # se il mercato e' aperto (funzione is_market_open) e non fa nulla se
   # e' chiuso, quindi non c'e' rischio di falsi allarmi fuori orario.
   schedule:
-    - cron: "*/15 13-21 * * 1-5"
+    - cron: "*/15 7-21 * * 1-5"
   # Permette anche di far partire il controllo a mano dalla tab "Actions" di GitHub
   workflow_dispatch: {}
 

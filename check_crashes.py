@@ -21,6 +21,7 @@ import io
 import json
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
@@ -59,23 +60,51 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 # causare rate-limiting (errori temporanei); 10 e' un buon compromesso.
 MAX_WORKERS = 10
 
-# Suffissi che Yahoo Finance richiede per riconoscere i titoli quotati sulle
-# borse europee (l'elenco copre i paesi presenti nell'EURO STOXX 50).
-COUNTRY_TO_YAHOO_SUFFIX = {
-    "france": ".PA",
-    "germany": ".DE",
-    "italy": ".MI",
-    "spain": ".MC",
-    "netherlands": ".AS",
-    "belgium": ".BR",
-    "finland": ".HE",
-    "ireland": ".IR",
-    "luxembourg": ".LU",
-    "portugal": ".LS",
-    "austria": ".VI",
-}
+# Suffissi che Yahoo Finance usa per i titoli quotati sulle borse europee
+# (servono per non convertire i punti in trattini nella pulizia finale,
+# vedi get_tickers()).
+EUROPEAN_SUFFIXES = (".MI", ".PA", ".DE", ".AS", ".MC", ".BR")
 
-EUROPEAN_SUFFIXES = tuple(COUNTRY_TO_YAHOO_SUFFIX.values())
+# FTSE MIB (Borsa Italiana, circa 40 titoli) ed EURO STOXX 50 (le 50
+# maggiori aziende dell'Eurozona) sono elenchi FISSI scritti qui nel codice,
+# invece di essere scaricati da Wikipedia come S&P 500 e Nasdaq-100.
+#
+# Perche': le pagine Wikipedia di questi due indici non hanno una tabella
+# componenti pulita e standard come quella di S&P 500 -- in fase di test lo
+# scraping ha prodotto ticker corrotti (es. "$TEN.MI.MI" invece di
+# "TEN.MI"), a causa di celle di tabella unite o mal strutturate. Un elenco
+# fisso e' meno elegante ma molto piu' affidabile per indici di queste
+# dimensioni, che cambiano composizione solo poche volte l'anno.
+#
+# Manutenzione: controlla ogni tanto (un paio di volte l'anno bastano) che
+# la composizione sia ancora corretta, ad esempio su borsaitaliana.it (per
+# il FTSE MIB) o stoxx.com (per l'EURO STOXX 50), e aggiorna le liste qui
+# sotto se necessario.
+FTSE_MIB_TICKERS = [
+    "A2A.MI", "AMP.MI", "AZM.MI", "BAMI.MI", "BC.MI", "BGN.MI", "BMPS.MI",
+    "BPE.MI", "CPR.MI", "DIA.MI", "ENEL.MI", "ENI.MI", "FBK.MI", "G.MI",
+    "HER.MI", "IG.MI", "INW.MI", "IP.MI", "ISP.MI", "IVG.MI", "LDO.MI",
+    "MB.MI", "MONC.MI", "NEXI.MI", "PIRC.MI", "PRY.MI", "PST.MI", "RACE.MI",
+    "REC.MI", "SPM.MI", "SRG.MI", "STLAM.MI", "STM.MI", "TEN.MI", "TIT.MI",
+    "TRN.MI", "UCG.MI", "UNI.MI",
+]
+
+EURO_STOXX50_TICKERS = [
+    # Francia
+    "MC.PA", "OR.PA", "SAN.PA", "TTE.PA", "AI.PA", "SU.PA", "BNP.PA", "CS.PA",
+    "DG.PA", "SAF.PA", "EL.PA", "RMS.PA", "RI.PA", "AIR.PA",
+    # Germania
+    "SAP.DE", "SIE.DE", "ALV.DE", "DTE.DE", "BAS.DE", "BAYN.DE", "MBG.DE",
+    "BMW.DE", "VOW3.DE", "MUV2.DE", "DB1.DE", "IFX.DE", "ADS.DE", "DHL.DE",
+    # Paesi Bassi
+    "ASML.AS", "ADYEN.AS", "HEIA.AS",
+    # Spagna
+    "ITX.MC", "IBE.MC", "BBVA.MC",
+    # Italia
+    "ENEL.MI", "ENI.MI", "ISP.MI", "UCG.MI", "STLAM.MI", "RACE.MI",
+    # Belgio
+    "ABI.BR",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -122,9 +151,18 @@ def get_sp500_tickers() -> list[str]:
 def get_nasdaq100_tickers() -> list[str]:
     try:
         tables = _fetch_wikipedia_tables("https://en.wikipedia.org/wiki/Nasdaq-100")
-        table, col = _find_table_with_column(tables, ["ticker"])
+        # Cerchiamo sia "ticker" che "symbol" (pagine diverse usano nomi
+        # diversi per la stessa colonna), e scartiamo tabelle troppo
+        # piccole per essere quella dei componenti (l'indice ne ha ~100).
+        table = col = None
+        for keywords in (["ticker"], ["symbol"]):
+            candidate, candidate_col = _find_table_with_column(tables, keywords)
+            if candidate is not None and len(candidate) >= 50:
+                table, col = candidate, candidate_col
+                break
         if table is None:
-            raise ValueError("colonna 'Ticker' non trovata nella pagina")
+            cols_seen = [list(map(str, t.columns)) for t in tables]
+            raise ValueError(f"colonna ticker/symbol non trovata (colonne viste: {cols_seen})")
         return [str(t).strip() for t in table[col].tolist()]
     except Exception as e:
         print(f"[WARN] impossibile scaricare la lista Nasdaq-100: {e}")
@@ -132,70 +170,17 @@ def get_nasdaq100_tickers() -> list[str]:
 
 
 def get_ftsemib_tickers() -> list[str]:
-    """Componenti del FTSE MIB (Borsa Italiana, circa 40 titoli). Yahoo
-    Finance richiede il suffisso '.MI' per i titoli quotati a Milano.
+    """Componenti del FTSE MIB. Elenco fisso, vedi commento su
+    FTSE_MIB_TICKERS piu' sopra nel file per il perche'.
     """
-    try:
-        tables = _fetch_wikipedia_tables("https://en.wikipedia.org/wiki/FTSE_MIB")
-        table, col = _find_table_with_column(tables, ["ticker", "symbol"])
-        if table is None:
-            raise ValueError("colonna ticker/symbol non trovata nella pagina")
-        return [
-            f"{str(t).strip()}.MI"
-            for t in table[col].tolist()
-            if str(t).strip() and str(t).strip().lower() != "nan"
-        ]
-    except Exception as e:
-        print(f"[WARN] impossibile scaricare la lista FTSE MIB: {e}")
-        return []
+    return list(FTSE_MIB_TICKERS)
 
 
 def get_eurostoxx50_tickers() -> list[str]:
-    """Componenti dell'EURO STOXX 50 (le 50 maggiori aziende dell'Eurozona).
-    A differenza di S&P 500, Nasdaq-100 e FTSE MIB, qui i titoli sono
-    quotati su borse diverse a seconda del paese dell'azienda, quindi
-    serve anche la colonna "Country" della tabella per scegliere il
-    suffisso Yahoo Finance corretto (es. '.PA' per Parigi, '.DE' per
-    Francoforte, '.MI' per Milano) tramite COUNTRY_TO_YAHOO_SUFFIX.
-
-    Nota: la struttura della pagina Wikipedia di un indice come questo puo'
-    cambiare nel tempo; se in futuro questa funzione smette di trovare
-    titoli, il modo per sistemarla e' aprire la pagina Wikipedia e vedere
-    come si chiamano ora le colonne della tabella dei componenti.
+    """Componenti dell'EURO STOXX 50. Elenco fisso, vedi commento su
+    EURO_STOXX50_TICKERS piu' sopra nel file per il perche'.
     """
-    try:
-        tables = _fetch_wikipedia_tables("https://en.wikipedia.org/wiki/EURO_STOXX_50")
-        target = ticker_col = country_col = None
-        for table in tables:
-            cols_lower = {str(c): str(c).lower() for c in table.columns}
-            t_col = next((c for c, lo in cols_lower.items() if "ticker" in lo), None)
-            c_col = next(
-                (c for c, lo in cols_lower.items() if "country" in lo or "domicile" in lo),
-                None,
-            )
-            if t_col and c_col:
-                target, ticker_col, country_col = table, t_col, c_col
-                break
-
-        if target is None:
-            raise ValueError("tabella con colonne 'Ticker' e 'Country' non trovata nella pagina")
-
-        tickers = []
-        for _, row in target.iterrows():
-            raw = str(row[ticker_col]).strip()
-            country = str(row[country_col]).strip().lower()
-            if not raw or raw.lower() == "nan":
-                continue
-            suffix = COUNTRY_TO_YAHOO_SUFFIX.get(country, "")
-            if not suffix:
-                # Paese non nella mappa: lo segnaliamo ma non blocchiamo il resto
-                print(f"[WARN] EURO STOXX 50: paese '{country}' non mappato per il ticker {raw}, saltato")
-                continue
-            tickers.append(f"{raw}{suffix}")
-        return tickers
-    except Exception as e:
-        print(f"[WARN] impossibile scaricare la lista EURO STOXX 50: {e}")
-        return []
+    return list(EURO_STOXX50_TICKERS)
 
 
 def get_tickers() -> list[str]:
@@ -203,12 +188,18 @@ def get_tickers() -> list[str]:
     FTSE MIB, EURO STOXX 50), toglie i duplicati e normalizza il formato
     dei ticker per Yahoo Finance.
 
-    Se una delle quattro fonti fallisce (es. Wikipedia cambia struttura),
-    lo script continua comunque con le altre tre: viene solo stampato un
-    avviso, non si interrompe tutto.
+    S&P 500 e Nasdaq-100 vengono scaricati da Wikipedia; se una delle due
+    fonti fallisce (es. Wikipedia cambia struttura), lo script continua
+    comunque con le altre: viene solo stampato un avviso, non si interrompe
+    tutto. FTSE MIB ed EURO STOXX 50 sono elenchi fissi (vedi sopra), quindi
+    non possono fallire per problemi di rete o di struttura della pagina.
     """
     all_tickers = set()
     all_tickers.update(get_sp500_tickers())
+    # Piccola pausa tra le due richieste a Wikipedia: aiuta a evitare un
+    # eventuale blocco temporaneo (rate limit) se le richieste sono troppo
+    # ravvicinate.
+    time.sleep(2)
     all_tickers.update(get_nasdaq100_tickers())
     all_tickers.update(get_ftsemib_tickers())
     all_tickers.update(get_eurostoxx50_tickers())

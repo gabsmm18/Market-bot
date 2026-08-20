@@ -4,15 +4,17 @@ check_crashes.py
 =================
 
 Script che:
-1. Scarica l'elenco dei titoli S&P 500 + Nasdaq-100
+1. Scarica l'elenco dei titoli monitorati: S&P 500, Nasdaq-100, FTSE MIB
+   (Borsa Italiana) ed EURO STOXX 50 (le 50 maggiori aziende dell'Eurozona)
 2. Calcola la variazione percentuale odierna (prezzo attuale vs chiusura precedente)
 3. Individua i titoli scesi di piu' della soglia (default 15%)
 4. Per ogni crollo trovato, recupera le ultime notizie collegate al titolo
 5. Manda un messaggio Telegram con ticker, variazione % e possibili motivi
 6. Tiene traccia di cosa e' gia' stato notificato oggi, per non spammare
 
-Pensato per girare periodicamente (es. ogni 15-30 minuti durante l'orario
-di mercato USA) tramite GitHub Actions -- vedi .github/workflows/monitor.yml
+Pensato per girare periodicamente (es. ogni 15 minuti, dall'apertura dei
+mercati europei alla chiusura di quello USA) tramite GitHub Actions -- vedi
+.github/workflows/monitor.yml
 """
 
 import io
@@ -20,7 +22,7 @@ import json
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -57,75 +59,202 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 # causare rate-limiting (errori temporanei); 10 e' un buon compromesso.
 MAX_WORKERS = 10
 
+# Suffissi che Yahoo Finance richiede per riconoscere i titoli quotati sulle
+# borse europee (l'elenco copre i paesi presenti nell'EURO STOXX 50).
+COUNTRY_TO_YAHOO_SUFFIX = {
+    "france": ".PA",
+    "germany": ".DE",
+    "italy": ".MI",
+    "spain": ".MC",
+    "netherlands": ".AS",
+    "belgium": ".BR",
+    "finland": ".HE",
+    "ireland": ".IR",
+    "luxembourg": ".LU",
+    "portugal": ".LS",
+    "austria": ".VI",
+}
+
+EUROPEAN_SUFFIXES = tuple(COUNTRY_TO_YAHOO_SUFFIX.values())
+
 
 # ---------------------------------------------------------------------------
 # 1. Universo dei titoli da monitorare
 # ---------------------------------------------------------------------------
 
-def get_tickers() -> list[str]:
-    """Scarica la lista dei componenti di S&P 500 e Nasdaq-100 da Wikipedia
-    e restituisce l'unione dei due elenchi (senza duplicati).
-
-    Usiamo Wikipedia perche' e' pubblica, gratuita e aggiornata a ogni
-    modifica degli indici. In alternativa si potrebbe usare un file CSV
-    statico da aggiornare a mano.
+def _fetch_wikipedia_tables(url: str) -> list:
+    """Scarica una pagina Wikipedia (con header da browser per evitare il
+    403 Forbidden) e restituisce tutte le tabelle HTML trovate come
+    DataFrame pandas.
     """
-    tickers = set()
+    resp = requests.get(url, headers=HTTP_HEADERS, timeout=20)
+    resp.raise_for_status()
+    return pd.read_html(io.StringIO(resp.text))
 
+
+def _find_table_with_column(tables: list, keywords: list[str]):
+    """Cerca, tra le tabelle passate, la prima che ha una colonna il cui nome
+    contiene una delle parole chiave indicate (case-insensitive).
+    Restituisce (tabella, nome_colonna) oppure (None, None) se non trovata.
+    """
+    for table in tables:
+        for col in table.columns:
+            col_name = str(col).lower()
+            if any(kw in col_name for kw in keywords):
+                return table, col
+    return None, None
+
+
+def get_sp500_tickers() -> list[str]:
     try:
-        resp = requests.get(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-            headers=HTTP_HEADERS,
-            timeout=20,
+        tables = _fetch_wikipedia_tables(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         )
-        resp.raise_for_status()
-        sp500_tables = pd.read_html(io.StringIO(resp.text))
-        sp500 = sp500_tables[0]["Symbol"].tolist()
-        tickers.update(sp500)
+        table, col = _find_table_with_column(tables, ["symbol"])
+        if table is None:
+            raise ValueError("colonna 'Symbol' non trovata nella pagina")
+        return [str(t).strip() for t in table[col].tolist()]
     except Exception as e:
         print(f"[WARN] impossibile scaricare la lista S&P 500: {e}")
+        return []
 
+
+def get_nasdaq100_tickers() -> list[str]:
     try:
-        resp = requests.get(
-            "https://en.wikipedia.org/wiki/Nasdaq-100",
-            headers=HTTP_HEADERS,
-            timeout=20,
-        )
-        resp.raise_for_status()
-        nasdaq_tables = pd.read_html(io.StringIO(resp.text))
-        # La tabella con i componenti e' quella che contiene la colonna "Ticker"
-        for table in nasdaq_tables:
-            if "Ticker" in table.columns:
-                tickers.update(table["Ticker"].tolist())
-                break
+        tables = _fetch_wikipedia_tables("https://en.wikipedia.org/wiki/Nasdaq-100")
+        table, col = _find_table_with_column(tables, ["ticker"])
+        if table is None:
+            raise ValueError("colonna 'Ticker' non trovata nella pagina")
+        return [str(t).strip() for t in table[col].tolist()]
     except Exception as e:
         print(f"[WARN] impossibile scaricare la lista Nasdaq-100: {e}")
+        return []
 
-    # Yahoo Finance vuole i ticker con "-" al posto di "." (es. BRK.B -> BRK-B)
-    cleaned = sorted({str(t).replace(".", "-").strip() for t in tickers if isinstance(t, str)})
+
+def get_ftsemib_tickers() -> list[str]:
+    """Componenti del FTSE MIB (Borsa Italiana, circa 40 titoli). Yahoo
+    Finance richiede il suffisso '.MI' per i titoli quotati a Milano.
+    """
+    try:
+        tables = _fetch_wikipedia_tables("https://en.wikipedia.org/wiki/FTSE_MIB")
+        table, col = _find_table_with_column(tables, ["ticker", "symbol"])
+        if table is None:
+            raise ValueError("colonna ticker/symbol non trovata nella pagina")
+        return [
+            f"{str(t).strip()}.MI"
+            for t in table[col].tolist()
+            if str(t).strip() and str(t).strip().lower() != "nan"
+        ]
+    except Exception as e:
+        print(f"[WARN] impossibile scaricare la lista FTSE MIB: {e}")
+        return []
+
+
+def get_eurostoxx50_tickers() -> list[str]:
+    """Componenti dell'EURO STOXX 50 (le 50 maggiori aziende dell'Eurozona).
+    A differenza di S&P 500, Nasdaq-100 e FTSE MIB, qui i titoli sono
+    quotati su borse diverse a seconda del paese dell'azienda, quindi
+    serve anche la colonna "Country" della tabella per scegliere il
+    suffisso Yahoo Finance corretto (es. '.PA' per Parigi, '.DE' per
+    Francoforte, '.MI' per Milano) tramite COUNTRY_TO_YAHOO_SUFFIX.
+
+    Nota: la struttura della pagina Wikipedia di un indice come questo puo'
+    cambiare nel tempo; se in futuro questa funzione smette di trovare
+    titoli, il modo per sistemarla e' aprire la pagina Wikipedia e vedere
+    come si chiamano ora le colonne della tabella dei componenti.
+    """
+    try:
+        tables = _fetch_wikipedia_tables("https://en.wikipedia.org/wiki/EURO_STOXX_50")
+        target = ticker_col = country_col = None
+        for table in tables:
+            cols_lower = {str(c): str(c).lower() for c in table.columns}
+            t_col = next((c for c, lo in cols_lower.items() if "ticker" in lo), None)
+            c_col = next(
+                (c for c, lo in cols_lower.items() if "country" in lo or "domicile" in lo),
+                None,
+            )
+            if t_col and c_col:
+                target, ticker_col, country_col = table, t_col, c_col
+                break
+
+        if target is None:
+            raise ValueError("tabella con colonne 'Ticker' e 'Country' non trovata nella pagina")
+
+        tickers = []
+        for _, row in target.iterrows():
+            raw = str(row[ticker_col]).strip()
+            country = str(row[country_col]).strip().lower()
+            if not raw or raw.lower() == "nan":
+                continue
+            suffix = COUNTRY_TO_YAHOO_SUFFIX.get(country, "")
+            if not suffix:
+                # Paese non nella mappa: lo segnaliamo ma non blocchiamo il resto
+                print(f"[WARN] EURO STOXX 50: paese '{country}' non mappato per il ticker {raw}, saltato")
+                continue
+            tickers.append(f"{raw}{suffix}")
+        return tickers
+    except Exception as e:
+        print(f"[WARN] impossibile scaricare la lista EURO STOXX 50: {e}")
+        return []
+
+
+def get_tickers() -> list[str]:
+    """Unisce le liste di tutti i mercati monitorati (S&P 500, Nasdaq-100,
+    FTSE MIB, EURO STOXX 50), toglie i duplicati e normalizza il formato
+    dei ticker per Yahoo Finance.
+
+    Se una delle quattro fonti fallisce (es. Wikipedia cambia struttura),
+    lo script continua comunque con le altre tre: viene solo stampato un
+    avviso, non si interrompe tutto.
+    """
+    all_tickers = set()
+    all_tickers.update(get_sp500_tickers())
+    all_tickers.update(get_nasdaq100_tickers())
+    all_tickers.update(get_ftsemib_tickers())
+    all_tickers.update(get_eurostoxx50_tickers())
+
+    # Yahoo Finance vuole i ticker USA con "-" al posto di "." (es. BRK.B ->
+    # BRK-B). Questa sostituzione NON va fatta sui ticker europei, che hanno
+    # gia' un suffisso come ".MI" o ".PA" e in cui il punto e' corretto cosi'.
+    cleaned = set()
+    for t in all_tickers:
+        t = str(t).strip()
+        if not t or t.lower() == "nan":
+            continue
+        if t.endswith(EUROPEAN_SUFFIXES):
+            cleaned.add(t)
+        else:
+            cleaned.add(t.replace(".", "-"))
+
+    cleaned = sorted(cleaned)
     print(f"[INFO] Universo monitorato: {len(cleaned)} titoli")
     return cleaned
 
 
 # ---------------------------------------------------------------------------
-# 2. Controllo se il mercato USA e' aperto
+# 2. Controllo se almeno uno dei mercati monitorati e' aperto
 # ---------------------------------------------------------------------------
 
-def is_market_open(now: datetime | None = None) -> bool:
-    """Controllo semplice sugli orari del NYSE/Nasdaq (9:30-16:00 ora di
-    New York, dal lunedi' al venerdi'). NON tiene conto dei giorni festivi
-    di borsa (es. Natale, Independence Day): in quei giorni lo script gira
-    comunque ma non trovera' variazioni di prezzo significative.
+def is_any_market_open(now: datetime | None = None) -> bool:
+    """Controlla se siamo in una fascia oraria in cui ALMENO UNO dei mercati
+    monitorati (USA, Borsa Italiana, borse dell'Eurozona) potrebbe essere
+    aperto. Invece di calcolare l'orario esatto di ciascuna borsa (che
+    cambia con l'ora legale in modo diverso da paese a paese), usiamo una
+    finestra ampia in UTC che copre dall'apertura europea (le 9:00 circa,
+    ora locale) alla chiusura USA (le 16:00 ora di New York): dalle 7:00
+    alle 21:00 UTC, tutti i giorni feriali.
+
+    Se in un dato momento solo alcuni dei mercati monitorati sono
+    effettivamente aperti, non e' un problema: i titoli dei mercati chiusi
+    in quel momento hanno semplicemente un prezzo invariato rispetto alla
+    chiusura precedente, quindi non generano falsi allarmi.
     """
-    ny_tz = ZoneInfo("America/New_York")
-    now = (now or datetime.now(ny_tz)).astimezone(ny_tz)
+    now = (now or datetime.now(ZoneInfo("UTC"))).astimezone(ZoneInfo("UTC"))
 
     if now.weekday() >= 5:  # 5=sabato, 6=domenica
         return False
 
-    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-    return market_open <= now <= market_close
+    return dtime(7, 0) <= now.time() <= dtime(21, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -249,11 +378,14 @@ def save_state(state: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
-    if not is_market_open():
-        print("[INFO] Mercato USA chiuso in questo momento, non faccio nulla.")
+    if not is_any_market_open():
+        print("[INFO] Nessuno dei mercati monitorati e' aperto in questo momento, non faccio nulla.")
         return
 
-    today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    # Usiamo la data UTC per lo stato "chi ho gia' notificato oggi": e'
+    # coerente su tutti i mercati monitorati (USA + Europa) ed evita di dover
+    # scegliere un unico fuso orario di riferimento tra i tanti coinvolti.
+    today = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
     state = load_state()
     already_notified = set(state.get(today, []))
 

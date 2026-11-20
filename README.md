@@ -1,70 +1,146 @@
-Markets App — Alert crolli azionari via Telegram
+# Market Bot: Stock Crash Alerts on Telegram
 
-App che controlla periodicamente i titoli di S&P 500, Nasdaq-100, FTSE MIB (Borsa Italiana) ed EURO STOXX 50 (le 50 maggiori aziende dell'Eurozona) e ti manda una notifica su Telegram quando un'azione perde piu' del 15% rispetto alla chiusura precedente, con le notizie recenti che possono spiegare il motivo.
+An automated bot that scans about **580 large-cap stocks** in the US and Europe every 15 minutes and sends a **Telegram alert** when a stock falls more than **15%** in a day, together with the latest news that may explain the move.
 
-Architettura: i tre pezzi del sistema
+It runs entirely on **GitHub Actions**: no server, no app to install, no cost.
 
-Qualsiasi sistema di "monitoraggio + alert" si scompone in tre parti indipendenti. Vale la pena capirle separatamente perche' sono anche i punti in cui, in futuro, potrai intervenire per migliorare il progetto.
+---
 
-Rilevatore (check_crashes.py, funzioni get_tickers, scan_market, get_price_change): scarica l'elenco dei titoli, interroga Yahoo Finance per il prezzo attuale e la chiusura precedente di ciascuno, calcola la variazione percentuale e filtra quelli sotto soglia.
-Arricchimento (funzione get_reason): per ogni crollo trovato, recupera le notizie recenti collegate al titolo, cosi' il messaggio non è solo "XYZ -18%" ma include anche un indizio del perche'.
-Notifica (funzione send_telegram_message): manda il messaggio via Telegram Bot API. Telegram fa da "app sul telefono": non serve pubblicare nulla su App Store/Play Store, basta avere Telegram installato.
+## Example alert
 
-Il tutto gira non sul tuo telefono, ma su un server gratuito di GitHub (GitHub Actions), a intervalli regolari — il telefono riceve solo il messaggio finale. Questo e' il motivo per cui non serve sviluppare una vera app nativa: il "backend" fa tutto il lavoro, il telefono e' solo il destinatario.
+Illustrative message (the alert text is in Italian; ticker and headlines are made up):
 
-Come funziona nel dettaglio
-is_any_market_open(): controlla se siamo in una fascia oraria (7:00-21:00 UTC, giorni feriali) in cui almeno uno dei mercati monitorati potrebbe essere aperto — copre sia l'apertura dei mercati europei sia l'orario di mercato USA. Se sono tutti chiusi, lo script esce subito senza fare nulla (evita chiamate inutili e falsi allarmi). Se in un dato momento solo alcuni mercati sono aperti, non e' un problema: i titoli dei mercati chiusi hanno un prezzo invariato rispetto alla chiusura precedente, quindi non generano falsi allarmi.
-get_tickers(): scarica da Wikipedia l'elenco aggiornato dei componenti di S&P 500, Nasdaq-100, FTSE MIB ed EURO STOXX 50 (circa 700 titoli in unione, con duplicati tolti), aggiungendo il suffisso corretto richiesto da Yahoo Finance per ciascuna borsa (es. .MI per Milano, .PA per Parigi, .DE per Francoforte). Se una delle quattro fonti fallisce, lo script continua comunque con le altre.
-scan_market(): interroga Yahoo Finance in parallelo (10 richieste alla volta) per non impiegare troppo tempo, e tiene solo i titoli scesi oltre la soglia (DROP_THRESHOLD_PCT, default 15).
-get_reason(): prende le ultime notizie di Yahoo Finance per quel ticker e ne elenca i titoli. Non usa un'intelligenza artificiale per "riassumere" (vedi sotto perche' e i possibili miglioramenti).
-state.json: tiene traccia di chi e' gia' stato notificato oggi, cosi' non ricevi lo stesso alert ogni 15 minuti finche' il titolo resta sotto soglia. Viene azzerato automaticamente il giorno dopo.
-Setup — passo per passo
-1. Crea il bot Telegram
-Apri Telegram, cerca @BotFather e avvia una chat.
-Manda /newbot, scegli un nome e uno username (deve finire in "bot").
-BotFather ti da' un token tipo 123456789:AAExxxxxxx — salvalo, ti servira' tra poco.
-Cerca il tuo bot appena creato (con lo username scelto) e mandagli un messaggio qualsiasi (es. "ciao") — serve per "attivare" la chat.
-2. Trova il tuo chat_id
-Cerca @userinfobot su Telegram, avvia una chat: ti restituisce il tuo Id numerico (es. 987654321). Quello e' il tuo TELEGRAM_CHAT_ID.
-3. Carica il progetto su GitHub
-Crea un account GitHub se non ce l'hai (gratuito): https://github.com
-Crea un nuovo repository (puo' essere privato).
-Carica tutti i file di questa cartella (check_crashes.py, requirements.txt, state.json, la cartella .github/, questo README.md) nel repository.
-4. Aggiungi i secret
+```
+XYZ: -18.4%
+Prezzo attuale: 42.51 (chiusura prec.: 52.10)
 
-Nel repository su GitHub: Settings → Secrets and variables → Actions → New repository secret. Crea due secret:
+Possibili motivi (dalle ultime notizie):
+- XYZ cuts full-year guidance after weak quarter (Reuters)
+- Analysts downgrade XYZ on margin pressure (Bloomberg)
+- XYZ CEO to step down (Yahoo Finance)
+```
 
-TELEGRAM_BOT_TOKEN → il token ottenuto da BotFather
-TELEGRAM_CHAT_ID → il tuo id ottenuto da userinfobot
+The message shows the daily change, current price vs previous close, and up to three recent headlines with their source.
 
-I secret non sono mai visibili nel codice: e' il modo corretto per gestire credenziali in un progetto pubblico o condiviso.
+---
 
-5. Attiva GitHub Actions
+## Coverage
 
-Vai nella tab Actions del repository, dovresti vedere il workflow "Monitor stock crashes". Se GitHub chiede di abilitarlo, clicca "I understand my workflows, go ahead and enable them".
+| Index | Stocks | Source |
+|---|---|---|
+| S&P 500 | ~500 | Wikipedia, refreshed at every run |
+| FTSE MIB (Italy) | 38 | Fixed list in the code |
+| Euro Stoxx 50 (euro area) | 41 | Fixed list in the code |
+| Nasdaq-100 | – | Currently not available (see Limitations) |
 
-6. Primo test manuale
+Duplicates are removed, and each ticker gets the Yahoo Finance exchange suffix it needs (`.MI` Milan, `.PA` Paris, `.DE` Frankfurt, …).
 
-Nella tab Actions, seleziona il workflow e clicca Run workflow per lanciarlo subito senza aspettare il prossimo orario schedulato. Controlla i log: se tutti i mercati sono chiusi vedrai un messaggio che lo dice; se almeno uno e' aperto, vedrai quanti titoli sono stati controllati e se sono stati trovati crolli.
+---
 
-Per essere sicuro che le notifiche Telegram funzionino, puoi abbassare temporaneamente DROP_THRESHOLD_PCT (nel file monitor.yml) a un valore piu' facile da raggiungere (es. 1), lanciare il workflow a mano, verificare che il messaggio arrivi, e poi rimetterlo a 15.
+## How it works
 
-Da quel momento in poi il sistema gira da solo, gratuitamente, ogni 15 minuti, dall'apertura dei mercati europei alla chiusura di quello USA.
+```
+GitHub Actions (every 15 min, Mon-Fri, 07:00-21:45 UTC)
+        │
+        ▼
+1. DETECT   → download tickers → get price vs previous close → keep drops ≤ -15%
+        │
+        ▼
+2. EXPLAIN  → fetch the latest 3 news headlines for each crashed stock
+        │
+        ▼
+3. NOTIFY   → send a Telegram message → save who was alerted today
+```
 
-Limiti di questa prima versione
-Niente sintesi AI vera: il "motivo" del crollo sono i titoli delle notizie piu' recenti, non un riassunto discorsivo. E' un buon punto di partenza ma non sempre e' immediato da leggere.
-Nessun calendario festivo: nei giorni di festa di borsa (es. Natale, Ferragosto, Thanksgiving) lo script gira comunque ma semplicemente non trova crolli.
-Copertura: S&P 500 (~500 titoli, da Wikipedia), FTSE MIB (~38 titoli) ed EURO STOXX 50 (~41 titoli) — questi ultimi due tramite elenchi fissi scritti nel codice (vedi sotto il perche'). Per l'Eurozona copriamo le 50 aziende piu' grandi e non l'indice allargato Euro Stoxx 600, che avrebbe richiesto una fonte dati meno affidabile e piu' complessa da mantenere.
-Nasdaq-100 attualmente non funziona: in fase di test, la pagina Wikipedia di Nasdaq-100 non restituisce (alle richieste automatiche che facciamo da GitHub Actions) una tabella leggibile con i componenti dell'indice, nonostante due diversi metodi di lettura tentati. Il sistema continua a funzionare normalmente lo stesso: nei log comparira' sempre [WARN] impossibile scaricare la lista Nasdaq-100, e nel conteggio totale dei titoli monitorati il Nasdaq-100 contribuisce con 0 -- ma dato che quasi tutte le aziende del Nasdaq-100 sono gia' incluse nell'S&P 500, la perdita di copertura reale e' piccola. Se in futuro vuoi provare a risolverlo, o preferisci un elenco fisso anche per questo (col rischio di qualche ticker non piu' aggiornato, essendo ~100 nomi), e' un intervento successivo possibile.
-Gli elenchi fissi di FTSE MIB ed EURO STOXX 50 vanno controllati ogni tanto: a differenza di S&P 500 (scaricato "fresco" ogni volta da Wikipedia), questi due elenchi sono scritti direttamente nel codice (FTSE_MIB_TICKERS ed EURO_STOXX50_TICKERS in check_crashes.py) e quindi non si aggiornano da soli se la composizione dell'indice cambia. Un controllo un paio di volte l'anno su borsaitaliana.it o stoxx.com basta a mantenerli corretti.
-Yahoo Finance non ufficiale: yfinance si appoggia a endpoint non documentati ufficialmente da Yahoo; puo' occasionalmente avere rallentamenti o richiedere piccoli aggiustamenti nel tempo.
-Possibili miglioramenti (per quando vorrai estenderlo)
-Sintesi AI del motivo: al posto dei soli titoli delle notizie, passare le headline a un modello linguistico (es. tramite l'API di Claude) che le riassuma in 2-3 frasi discorsive in italiano. Richiede una chiave API di Anthropic (a pagamento in base all'uso, ma i costi restano minimi dato che scatta solo sui crolli effettivi).
-Watchlist personalizzata: aggiungere/rimuovere titoli specifici a tua scelta, oltre o al posto degli indici.
-Euro Stoxx 600 completo: se in futuro vuoi la copertura piu' ampia (600 titoli su 17 borse), serve una fonte dati diversa da Wikipedia (es. le liste componenti pubblicate da un ETF che replica l'indice) e un mantenimento periodico della lista.
-Calendario festivita' di borsa: usare la libreria pandas-market-calendars per evitare esecuzioni inutili nei giorni di chiusura.
-Storico e dashboard: salvare ogni alert in un file/foglio e costruire una piccola pagina web che mostra lo storico dei crolli rilevati.
-Soglie multiple: notifiche differenziate per -10%, -15%, -20% con urgenza diversa.
-Costi
+| Step | Function | What it does |
+|---|---|---|
+| Market check | `is_any_market_open()` | Exits immediately if no market is open (weekends, nights) |
+| Tickers | `get_tickers()` | Builds the list of stocks to monitor |
+| Scan | `scan_market()`, `get_price_change()` | Queries Yahoo Finance in parallel (10 requests at a time) and keeps stocks below the threshold |
+| News | `get_reason()` | Retrieves the latest headlines for each crashed stock |
+| Alert | `send_telegram_message()` | Sends the message through the Telegram Bot API |
+| Memory | `state.json` | Stores which stocks were already alerted today, so the same alert is not sent every 15 minutes. Resets daily |
 
-Tutto il progetto, cosi' com'e', e' gratuito: GitHub Actions offre minuti gratuiti generosi per repository pubblici (e comunque un buon numero anche per repository privati), Telegram e Yahoo Finance (via yfinance) non richiedono pagamento. L'unico costo eventuale sarebbe se in futuro aggiungi la sintesi AI con l'API di Claude (a consumo, tipicamente centesimi al mese per questo tipo di volume).
+---
+
+## Repository structure
+
+```
+├── check_crashes.py             # the whole bot
+├── state.json                   # stocks already alerted today
+├── requirements.txt             # yfinance, requests, pandas, lxml
+└── .github/workflows/monitor.yml   # schedule and GitHub Actions setup
+```
+
+---
+
+## Setup (about 10 minutes)
+
+**1. Create a Telegram bot**
+- In Telegram, open **@BotFather** and send `/newbot`.
+- Choose a name and a username ending in `bot`.
+- Copy the **token** (e.g. `123456789:AAE...`).
+- Send any message to your new bot to activate the chat.
+
+**2. Get your chat ID**
+- Open **@userinfobot** in Telegram: it replies with your numeric ID.
+
+**3. Add the secrets to GitHub**
+- Repository → **Settings → Secrets and variables → Actions → New repository secret**:
+
+| Secret | Value |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | token from BotFather |
+| `TELEGRAM_CHAT_ID` | ID from userinfobot |
+
+Secrets are never visible in the code, so the repository can safely be public.
+
+**4. Enable and test**
+- Open the **Actions** tab and enable the workflow *Monitor stock crashes*.
+- Click **Run workflow** to run it immediately.
+- To check that Telegram works, temporarily set `DROP_THRESHOLD_PCT` to `1` in `monitor.yml`, run it, then set it back to `15`.
+
+From then on the bot runs on its own.
+
+---
+
+## Settings
+
+| Variable | Where | Default | Meaning |
+|---|---|---|---|
+| `DROP_THRESHOLD_PCT` | `monitor.yml` | `15` | Daily fall (%) that triggers an alert |
+| `cron` | `monitor.yml` | `*/15 7-21 * * 1-5` | How often the bot runs |
+| `FTSE_MIB_TICKERS`, `EURO_STOXX50_TICKERS` | `check_crashes.py` | – | Fixed lists of European stocks |
+
+---
+
+## Limitations
+
+- **Nasdaq-100 not available.** Its Wikipedia page does not return a readable table to automated requests. The impact is small, because almost all Nasdaq-100 companies are already in the S&P 500.
+- **Fixed European lists.** FTSE MIB and Euro Stoxx 50 members are hard-coded and do not update automatically; they should be checked a couple of times a year.
+- **News headlines, not explanations.** The "reason" is a list of recent headlines, not a written summary.
+- **No holiday calendar.** On exchange holidays the bot still runs, but finds no crashes.
+- **Unofficial data source.** `yfinance` relies on undocumented Yahoo Finance endpoints, which can occasionally change or slow down.
+
+---
+
+## Possible improvements
+
+- **AI summary**: pass the headlines to a language model to explain the crash in two or three sentences
+- **Custom watchlist** in addition to the indices
+- **Multiple thresholds** (−10%, −15%, −20%) with different urgency
+- **Exchange holiday calendar** with `pandas-market-calendars`
+- **Wider coverage**: Stoxx Europe 600, using an ETF's holdings file as source
+- **History and dashboard** of all alerts
+
+---
+
+## Cost
+
+**Free.** GitHub Actions minutes are free for public repositories, and Telegram and Yahoo Finance require no payment. An AI summary would add a small usage-based cost.
+
+---
+
+## Tech stack
+
+Python · yfinance · pandas · Telegram Bot API · GitHub Actions

@@ -2,7 +2,7 @@
 
 An automated bot that scans about **580 large-cap stocks** in the US and Europe every 15 minutes and sends a **Telegram alert** when a stock falls more than **15%** in a day, together with the latest news that may explain the move.
 
-It runs entirely on **GitHub Actions**: no server, no app to install, no cost.
+It runs entirely on **GitHub Actions**
 
 ---
 
@@ -133,11 +133,7 @@ From then on the bot runs on its own.
 - **Wider coverage**: Stoxx Europe 600, using an ETF's holdings file as source
 - **History and dashboard** of all alerts
 
----
 
-## Cost
-
-**Free.** GitHub Actions minutes are free for public repositories, and Telegram and Yahoo Finance require no payment. An AI summary would add a small usage-based cost.
 
 ---
 
